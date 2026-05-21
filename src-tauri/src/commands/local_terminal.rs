@@ -15,6 +15,16 @@ const READ_BATCH_LIMIT: usize = 8 * 1024;
 const READ_CHANNEL_CAPACITY: usize = 128;
 const MAX_WRITE_BYTES: usize = 64 * 1024;
 
+#[cfg(unix)]
+fn terminate_process_group(process_group_leader: libc::pid_t) {
+    let process_group_id = -process_group_leader;
+
+    unsafe {
+        let _ = libc::kill(process_group_id, libc::SIGHUP);
+        let _ = libc::kill(process_group_id, libc::SIGTERM);
+    }
+}
+
 type SharedLocalShellSession = Arc<Mutex<LocalShellSession>>;
 
 fn spawn_reader_task(
@@ -192,6 +202,11 @@ impl LocalShellSession {
             task.abort();
         }
 
+        #[cfg(unix)]
+        if let Some(process_group_leader) = self.master.lock().await.process_group_leader() {
+            terminate_process_group(process_group_leader);
+        }
+
         if let Err(error) = self.child.lock().await.kill() {
             log::debug!("local shell kill during disconnect returned: {error}");
         }
@@ -213,6 +228,13 @@ impl Drop for LocalShellSession {
 
         if let Some(task) = self.exit_task.take() {
             task.abort();
+        }
+
+        #[cfg(unix)]
+        if let Ok(master) = self.master.try_lock() {
+            if let Some(process_group_leader) = master.process_group_leader() {
+                terminate_process_group(process_group_leader);
+            }
         }
 
         if let Ok(mut child) = self.child.try_lock() {

@@ -27,4 +27,5 @@ dist-ssr
 .claude/
 .sisyphus/
 .issue/
+.mcp.json
 dev.log
