@@ -1,6 +1,6 @@
 [package]
 name = "iris-ssh-manager"
-version = "0.11.10"
+version = "0.11.11"
 description = "A modern, cross-platform SSH client and connection manager"
 authors = ["rayenking"]
 license = "MIT"

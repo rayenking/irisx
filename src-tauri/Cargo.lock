@@ -2601,7 +2601,7 @@ dependencies = [
 
 [[package]]
 name = "iris-ssh-manager"
-version = "0.11.10"
+version = "0.11.11"
 dependencies = [
  "aes-gcm",
  "anyhow",
