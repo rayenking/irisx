@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { tauriApi } from '../lib/tauri';
 import type { SplitBranch, SplitDirection, SplitLeaf, SplitNode } from '../types/split';
 import type { TabStatus } from '../types/terminal';
 
@@ -10,6 +11,18 @@ type PaneRuntime = {
   cwd?: string;
   status?: TabStatus;
 };
+
+function disconnectPaneSessions(runtimes: Array<PaneRuntime | undefined>) {
+  for (const runtime of runtimes) {
+    if (!runtime?.sessionId) continue;
+
+    if (runtime.connectionId === 'local') {
+      void tauriApi.localShellDisconnect(runtime.sessionId).catch(() => {});
+    } else {
+      void tauriApi.sshDisconnect(runtime.sessionId).catch(() => {});
+    }
+  }
+}
 
 interface SplitState {
   splitTrees: Record<string, SplitNode>;
@@ -302,6 +315,8 @@ export const useSplitStore = create<SplitState>((set, get) => ({
       }
 
       const paneIds = collectPaneIds(tree);
+      disconnectPaneSessions(paneIds.map((paneId) => state.paneRuntimeById[paneId]));
+
       const nextTrees = { ...state.splitTrees };
       delete nextTrees[tabId];
 
@@ -463,6 +478,8 @@ export const useSplitStore = create<SplitState>((set, get) => ({
       if (!nextTree) {
         return state;
       }
+
+      disconnectPaneSessions([state.paneRuntimeById[paneId]]);
 
       const nextPaneIds = collectPaneIds(nextTree);
       const nextPaneRuntimeById = { ...state.paneRuntimeById };

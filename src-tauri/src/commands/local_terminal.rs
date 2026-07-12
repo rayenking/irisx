@@ -16,13 +16,131 @@ const READ_CHANNEL_CAPACITY: usize = 128;
 const MAX_WRITE_BYTES: usize = 64 * 1024;
 
 #[cfg(unix)]
-fn terminate_process_group(process_group_leader: libc::pid_t) {
-    let process_group_id = -process_group_leader;
-
+fn signal_pid(pid: libc::pid_t, signal: libc::c_int) {
     unsafe {
-        let _ = libc::kill(process_group_id, libc::SIGHUP);
-        let _ = libc::kill(process_group_id, libc::SIGTERM);
+        let _ = libc::kill(pid, signal);
     }
+}
+
+/// Collect the full descendant tree under `root_pid` (including root).
+/// npm/vite/python often leave the shell process group, so group kill alone
+/// leaves them orphaned and holding ports.
+#[cfg(target_os = "linux")]
+fn collect_process_tree(root_pid: u32) -> Vec<u32> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::fs;
+
+    let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
+
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                continue;
+            };
+
+            let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+
+            // comm can contain spaces/parens — ppid is the 4th field after the closing ')'.
+            let Some(after_comm) = stat.rsplit(')').next() else {
+                continue;
+            };
+            let fields: Vec<&str> = after_comm.split_whitespace().collect();
+            // fields[0]=state, fields[1]=ppid
+            if let Some(ppid) = fields.get(1).and_then(|value| value.parse::<u32>().ok()) {
+                children_of.entry(ppid).or_default().push(pid);
+            }
+        }
+    }
+
+    let mut ordered = Vec::new();
+    let mut seen = HashSet::new();
+    let mut queue = VecDeque::from([root_pid]);
+
+    while let Some(pid) = queue.pop_front() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        ordered.push(pid);
+        if let Some(children) = children_of.get(&pid) {
+            queue.extend(children.iter().copied());
+        }
+    }
+
+    ordered
+}
+
+#[cfg(target_os = "macos")]
+fn collect_process_tree(root_pid: u32) -> Vec<u32> {
+    use std::collections::{HashSet, VecDeque};
+    use std::process::Command;
+
+    let mut ordered = Vec::new();
+    let mut seen = HashSet::new();
+    let mut queue = VecDeque::from([root_pid]);
+
+    while let Some(pid) = queue.pop_front() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        ordered.push(pid);
+
+        let Ok(output) = Command::new("pgrep").args(["-P", &pid.to_string()]).output() else {
+            continue;
+        };
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Ok(child) = line.trim().parse::<u32>() {
+                queue.push_back(child);
+            }
+        }
+    }
+
+    ordered
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn collect_process_tree(root_pid: u32) -> Vec<u32> {
+    vec![root_pid]
+}
+
+#[cfg(unix)]
+fn signal_process_tree(root_pid: u32, signal: libc::c_int) {
+    // Children first so parents don't reap and hide them mid-walk.
+    let mut tree = collect_process_tree(root_pid);
+    tree.reverse();
+    for pid in tree {
+        signal_pid(pid as libc::pid_t, signal);
+    }
+}
+
+#[cfg(unix)]
+fn terminate_shell_tree(process_group_leader: Option<libc::pid_t>, child_pid: Option<u32>) {
+    if let Some(leader) = process_group_leader {
+        let process_group_id = -leader;
+        // SIGHUP first so interactive shells drop job-control children.
+        signal_pid(process_group_id, libc::SIGHUP);
+        signal_pid(process_group_id, libc::SIGTERM);
+    }
+
+    if let Some(pid) = child_pid {
+        signal_process_tree(pid, libc::SIGTERM);
+    }
+
+    // Child servers often ignore HUP/TERM. Hard-kill after a short grace period.
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+
+        if let Some(leader) = process_group_leader {
+            signal_pid(-leader, libc::SIGKILL);
+        }
+
+        if let Some(pid) = child_pid {
+            signal_process_tree(pid, libc::SIGKILL);
+        }
+    });
 }
 
 type SharedLocalShellSession = Arc<Mutex<LocalShellSession>>;
@@ -203,8 +321,9 @@ impl LocalShellSession {
         }
 
         #[cfg(unix)]
-        if let Some(process_group_leader) = self.master.lock().await.process_group_leader() {
-            terminate_process_group(process_group_leader);
+        {
+            let process_group_leader = self.master.lock().await.process_group_leader();
+            terminate_shell_tree(process_group_leader, self.child_pid);
         }
 
         if let Err(error) = self.child.lock().await.kill() {
@@ -231,10 +350,13 @@ impl Drop for LocalShellSession {
         }
 
         #[cfg(unix)]
-        if let Ok(master) = self.master.try_lock() {
-            if let Some(process_group_leader) = master.process_group_leader() {
-                terminate_process_group(process_group_leader);
-            }
+        {
+            let process_group_leader = self
+                .master
+                .try_lock()
+                .ok()
+                .and_then(|master| master.process_group_leader());
+            terminate_shell_tree(process_group_leader, self.child_pid);
         }
 
         if let Ok(mut child) = self.child.try_lock() {
@@ -268,6 +390,17 @@ impl LocalShellPool {
 
     pub async fn remove(&self, id: &Uuid) -> Option<SharedLocalShellSession> {
         self.sessions.write().await.remove(id)
+    }
+
+    pub async fn disconnect_all(&self) {
+        let sessions: Vec<_> = {
+            let mut guard = self.sessions.write().await;
+            guard.drain().map(|(_, session)| session).collect()
+        };
+
+        for session in sessions {
+            let _ = session.lock().await.disconnect().await;
+        }
     }
 }
 

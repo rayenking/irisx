@@ -288,7 +288,14 @@ export function TerminalView({
         sessionId = await connect(connectionId, handleStreamData, initialCols, initialRows);
       }
 
+      // Cancelled while connect/attach was in-flight.
       if (!sessionId) return;
+
+      // Pane closed while connect was in-flight.
+      if (!useSplitStore.getState().paneRuntimeById[paneId]) {
+        void disconnect(sessionId).catch(() => {});
+        return;
+      }
 
       sessionIdRef.current = sessionId;
       mountedSessionIdRef.current = sessionId;
@@ -302,7 +309,7 @@ export function TerminalView({
     } finally {
       connectingRef.current = false;
     }
-  }, [attach, connect, connectionId, emitSessionChange, emitStatusChange, handleStreamData, paneId, setPaneSessionId, setPaneStatus]);
+  }, [attach, connect, connectionId, disconnect, emitSessionChange, emitStatusChange, handleStreamData, paneId, paneRuntime?.sessionId, setPaneSessionId, setPaneStatus]);
 
   const handleReconnect = useCallback(() => {
     const oldSessionId = sessionIdRef.current;
@@ -325,6 +332,11 @@ export function TerminalView({
     disconnectRef.current = disconnect;
   }, [disconnect]);
 
+  const cancelConnectRef = useRef(cancelConnect);
+  useEffect(() => {
+    cancelConnectRef.current = cancelConnect;
+  }, [cancelConnect]);
+
   useEffect(() => {
     if (mountedSessionIdRef.current || sessionIdRef.current) return;
     void doConnectRef.current();
@@ -335,19 +347,18 @@ export function TerminalView({
         reconnectTimerRef.current = null;
       }
 
-      const sessionId = mountedSessionIdRef.current;
       const paneStillExists = Boolean(useSplitStore.getState().paneRuntimeById[paneId]);
       if (paneStillExists) return;
 
+      const sessionId = mountedSessionIdRef.current ?? sessionIdRef.current;
       mountedSessionIdRef.current = null;
       sessionIdRef.current = null;
 
       if (sessionId) {
-        setPaneSessionId(paneId, undefined);
-        emitSessionChange(undefined);
-        emitStatusChange('disconnected');
-        setPaneStatus(paneId, 'disconnected');
         void disconnectRef.current(sessionId).catch(() => {});
+      } else {
+        // In-flight connect: cancel so resolve path disconnects the new session.
+        cancelConnectRef.current();
       }
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps

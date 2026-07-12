@@ -1,10 +1,27 @@
-use tauri::Manager;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use tauri::{Manager, RunEvent};
 
 pub mod commands;
 pub mod config;
 pub mod db;
 pub mod keychain;
 pub mod ssh;
+
+static EXIT_CLEANUP_DONE: AtomicBool = AtomicBool::new(false);
+
+async fn cleanup_sessions(app: &tauri::AppHandle) {
+    if let Some(local_pool) = app.try_state::<commands::local_terminal::LocalShellPool>() {
+        local_pool.disconnect_all().await;
+    }
+
+    if let Some(ssh_pool) = app.try_state::<ssh::pool::SshPool>() {
+        ssh_pool.0.disconnect_all().await;
+    }
+
+    // Wait for the deferred SIGKILL pass in terminate_shell_tree.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -110,6 +127,22 @@ pub fn run() {
             commands::backup::preview_import,
             commands::backup::import_data
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Finish killing shells before the process dies, otherwise the deferred
+            // SIGKILL threads never run and child servers keep ports open.
+            if let RunEvent::ExitRequested { api, .. } = &event {
+                if EXIT_CLEANUP_DONE.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+
+                api.prevent_exit();
+                let handle = app.clone();
+                tauri::async_runtime::block_on(async move {
+                    cleanup_sessions(&handle).await;
+                });
+                app.exit(0);
+            }
+        });
 }

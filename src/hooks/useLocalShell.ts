@@ -24,16 +24,20 @@ export function useLocalShell() {
   const [connectionState, setConnectionState] = useState<TabStatus>('disconnected');
   const [error, setError] = useState<string | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
+  const cancelledRef = useRef(false);
 
   const open = useCallback(async (cols: number, rows: number, onData: LocalShellDataHandler, cwd?: string) => {
+    cancelledRef.current = false;
     setConnectionState('connecting');
     setError(null);
 
     const channel = new Channel<number[]>();
     channel.onmessage = (data) => {
+      if (cancelledRef.current) return;
       if (data.length === 0) {
         activeSessionIdRef.current = null;
         setConnectionState('disconnected');
+        return;
       }
 
       onData(data);
@@ -45,10 +49,17 @@ export function useLocalShell() {
         'Local shell startup timed out',
         LOCAL_SHELL_STARTUP_TIMEOUT_MS,
       );
+
+      if (cancelledRef.current) {
+        void tauriApi.localShellDisconnect(sessionId).catch(() => {});
+        return undefined;
+      }
+
       activeSessionIdRef.current = sessionId;
       setConnectionState('connected');
       return sessionId;
     } catch (openError) {
+      if (cancelledRef.current) return undefined;
       const message = openError instanceof Error ? openError.message : 'Failed to start local shell';
       setConnectionState('error');
       setError(message);
@@ -57,14 +68,17 @@ export function useLocalShell() {
   }, []);
 
   const attach = useCallback(async (sessionId: string, cols: number, rows: number, onData: LocalShellDataHandler) => {
+    cancelledRef.current = false;
     setConnectionState('connecting');
     setError(null);
 
     const channel = new Channel<number[]>();
     channel.onmessage = (data) => {
+      if (cancelledRef.current) return;
       if (data.length === 0) {
         activeSessionIdRef.current = null;
         setConnectionState('disconnected');
+        return;
       }
 
       onData(data);
@@ -72,10 +86,17 @@ export function useLocalShell() {
 
     try {
       await tauriApi.localShellAttach(channel, sessionId, cols, rows);
+
+      if (cancelledRef.current) {
+        void tauriApi.localShellDisconnect(sessionId).catch(() => {});
+        return undefined;
+      }
+
       activeSessionIdRef.current = sessionId;
       setConnectionState('connected');
       return sessionId;
     } catch (attachError) {
+      if (cancelledRef.current) return undefined;
       const message = attachError instanceof Error ? attachError.message : 'Failed to attach local shell';
       setConnectionState('error');
       setError(message);
@@ -84,6 +105,7 @@ export function useLocalShell() {
   }, []);
 
   const close = useCallback(async (sessionId?: string | null) => {
+    cancelledRef.current = true;
     const targetSessionId = sessionId ?? activeSessionIdRef.current;
 
     if (!targetSessionId) {

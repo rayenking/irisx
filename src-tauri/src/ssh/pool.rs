@@ -40,6 +40,17 @@ impl ConnectionPool {
     pub async fn list_active(&self) -> Vec<Uuid> {
         self.sessions.read().await.keys().copied().collect()
     }
+
+    pub async fn disconnect_all(&self) {
+        let sessions: Vec<_> = {
+            let mut guard = self.sessions.write().await;
+            guard.drain().map(|(_, session)| session).collect()
+        };
+
+        for session in sessions {
+            let _ = session.lock().await.disconnect().await;
+        }
+    }
 }
 
 pub struct SshPool(pub ConnectionPool);

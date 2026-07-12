@@ -293,7 +293,7 @@ export function LocalTerminalView({
       const rows = terminal.rows || 24;
       const existingSessionId = paneRuntime?.sessionId;
 
-      let sessionId: string;
+      let sessionId: string | undefined;
       if (existingSessionId) {
         try {
           sessionId = await attach(existingSessionId, cols, rows, handleStreamData);
@@ -303,6 +303,17 @@ export function LocalTerminalView({
         }
       } else {
         sessionId = await open(cols, rows, handleStreamData, paneRuntime?.cwd ?? undefined);
+      }
+
+      // Cancelled while open/attach was in-flight — backend already disconnected.
+      if (!sessionId) {
+        return;
+      }
+
+      // Pane closed while open was in-flight: kill immediately so child servers die.
+      if (!useSplitStore.getState().paneRuntimeById[paneId]) {
+        void close(sessionId).catch(() => {});
+        return;
       }
 
       sessionIdRef.current = sessionId;
@@ -335,7 +346,7 @@ export function LocalTerminalView({
     } finally {
       openingRef.current = false;
     }
-  }, [attach, emitSessionChange, emitStatusChange, handleStreamData, open, paneId, resize, setPaneCwd, setPaneSessionId, setPaneStatus]);
+  }, [attach, close, emitSessionChange, emitStatusChange, handleStreamData, open, paneId, paneRuntime?.cwd, paneRuntime?.sessionId, resize, setPaneCwd, setPaneSessionId, setPaneStatus]);
 
   const doOpenRef = useRef(doOpen);
   useEffect(() => {
@@ -352,20 +363,15 @@ export function LocalTerminalView({
     void doOpenRef.current();
 
     return () => {
-      const sessionId = mountedSessionIdRef.current;
       const paneStillExists = Boolean(useSplitStore.getState().paneRuntimeById[paneId]);
+      // Pane still in store (StrictMode remount / keep-alive) — leave the shell alone.
       if (paneStillExists) return;
 
+      const sessionId = mountedSessionIdRef.current ?? sessionIdRef.current;
       mountedSessionIdRef.current = null;
       sessionIdRef.current = null;
-
-      if (sessionId) {
-        setPaneSessionId(paneId, undefined);
-        emitSessionChange(undefined);
-        emitStatusChange('disconnected');
-        setPaneStatus(paneId, 'disconnected');
-        void closeRef.current(sessionId).catch(() => {});
-      }
+      // close(null) still sets cancelledRef so an in-flight open disconnects on resolve.
+      void closeRef.current(sessionId).catch(() => {});
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paneId]);
